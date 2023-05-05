@@ -193,11 +193,17 @@ public:
         const ConnectionTimeouts & timeouts,
         Poco::Net::HTTPBasicCredentials & credentials,
         const HTTPHeaderEntries & headers,
-        bool glob_url,
-        bool delay_initialization);
+        bool skip_if_not_found);
 
 private:
-    using InitializeFunc = std::function<void(const FailoverOptions &)>;
+    enum class InitResult
+    {
+        Ok,
+        /// Silently skip this URI.
+        Skip,
+    };
+
+    using InitializeFunc = std::function<InitResult(const FailoverOptions &)>;
     InitializeFunc initialize;
 
     String name;
