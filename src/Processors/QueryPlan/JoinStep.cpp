@@ -36,7 +36,7 @@ static SortDescription getSortDescription(const Names & key_names)
 {
     SortDescription sort_description;
     sort_description.reserve(key_names.size());
-    NameSet used_keys;
+    std::unordered_set<std::string_view> used_keys;
     for (const auto & key_name : key_names)
     {
         if (!used_keys.insert(key_name).second)

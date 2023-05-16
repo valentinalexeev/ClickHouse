@@ -1,4 +1,3 @@
-
 #include <Processors/QueryPlan/Optimizations/optimizeInOrderCommon.h>
 
 

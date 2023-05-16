@@ -24,6 +24,7 @@
 #include <Processors/QueryPlan/JoinStep.h>
 #include <Processors/QueryPlan/LimitStep.h>
 #include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
+#include <Processors/QueryPlan/Optimizations/optimizeInOrderCommon.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
 #include <Processors/QueryPlan/SortingStep.h>
 #include <Processors/QueryPlan/TotalsHavingStep.h>
@@ -32,44 +33,8 @@
 
 #include <Storages/StorageMerge.h>
 
-#include <Processors/QueryPlan/Optimizations/optimizeInOrderCommon.h>
-
-
 namespace DB::QueryPlanOptimizations
 {
-
-static Permutation flattenPositions(const std::vector<Positions> & positions)
-{
-    Permutation res;
-    res.reserve(positions.size());
-    for (const auto & pos : positions)
-        res.insert(res.end(), pos.begin(), pos.end());
-    return res;
-}
-
-static size_t findPrefixMatchLength(const std::vector<Positions> & positions, const Permutation & flattened)
-{
-    size_t flatten_idx = 0;
-    for (size_t i = 0; i < positions.size(); ++i)
-    {
-        for (size_t e : positions[i])
-        {
-            if (e != flattened[flatten_idx])
-                return i;
-            ++flatten_idx;
-        }
-    }
-    return positions.size();
-}
-
-/// Choose order info that use longer prefix of sorting key.
-/// Returns true if lhs is better than rhs.
-static bool compareOrderInfos(const InputOrderInfoPtr & lhs, const InputOrderInfoPtr & rhs)
-{
-    size_t lhs_size = lhs ? lhs->used_prefix_of_sorting_key_size : 0;
-    size_t rhs_size = rhs ? rhs->used_prefix_of_sorting_key_size : 0;
-    return lhs_size >= rhs_size;
-}
 
 /// Cut order info to use only prefix of specified size
 static void truncateToPrefixSize(StepInputOrder & order_info, size_t prefix_size)
@@ -107,36 +72,36 @@ static void truncateToPrefixSize(StepInputOrder & order_info, size_t prefix_size
 static Permutation findCommonOrderInfo(StepInputOrder & left_order_info, StepInputOrder & right_order_info)
 {
     if (!left_order_info.input_order && !right_order_info.input_order)
-    {
-        LOG_TRACE(getLogger(), "Cannot read anything in order for join");
         return {};
-    }
-
     if (!right_order_info.input_order)
-    {
-        LOG_TRACE(getLogger(), "Can read left stream in order for join");
-        return flattenPositions(left_order_info.permutation);
-    }
-
+        return left_order_info.permutation;
     if (!left_order_info.input_order)
+        return right_order_info.permutation;
+
+    chassert(left_order_info.permutation.size() == right_order_info.permutation.size());
+
+    size_t common_prefix_length = 0;
+    for (; common_prefix_length < left_order_info.permutation.size(); ++common_prefix_length)
     {
-        LOG_TRACE(getLogger(), "Can read right stream in order for join");
-        return flattenPositions(right_order_info.permutation);
+        if (left_order_info.permutation[common_prefix_length] != right_order_info.permutation[common_prefix_length])
+            break;
     }
 
-    LOG_TRACE(getLogger(), "Can read both streams in order for join");
-
-    bool left_is_better = compareOrderInfos(left_order_info.input_order, right_order_info.input_order);
-    auto & lhs = left_is_better ? left_order_info : right_order_info;
-    auto & rhs = left_is_better ? right_order_info : left_order_info;
-
-    Permutation result_permutation = flattenPositions(lhs.permutation);
-    size_t prefix_size = findPrefixMatchLength(rhs.permutation, result_permutation);
-    truncateToPrefixSize(rhs, prefix_size);
-    return result_permutation;
+    size_t left_length = left_order_info.input_order->used_prefix_of_sorting_key_size;
+    size_t right_length = right_order_info.input_order->used_prefix_of_sorting_key_size;
+    if (left_length >= right_length)
+    {
+        truncateToPrefixSize(right_order_info, common_prefix_length);
+        return left_order_info.permutation;
+    }
+    else
+    {
+        truncateToPrefixSize(left_order_info, common_prefix_length);
+        return right_order_info.permutation;
+    }
 }
 
-static bool optimizeJoinInOrder(QueryPlan::Node & node, const std::shared_ptr<FullSortingMergeJoin> & join_ptr)
+static bool optimizeJoinInOrder(QueryPlan::Node & node, FullSortingMergeJoin * join_ptr)
 {
     auto * left_child_node = node.children[0];
     auto * right_child_node = node.children[1];
@@ -156,8 +121,6 @@ static bool optimizeJoinInOrder(QueryPlan::Node & node, const std::shared_ptr<Fu
     auto keys_permuation = findCommonOrderInfo(left_order_info, right_order_info);
     if (keys_permuation.empty())
         return false;
-
-    LOG_TRACE(getLogger(), "Applying permutation [{}] for join keys", fmt::join(keys_permuation, ", "));
 
     join_ptr->permuteKeys(keys_permuation);
 
@@ -186,7 +149,7 @@ void applyOrderForJoin(QueryPlan::Node & node, QueryPlan::Nodes & nodes, const Q
     if (!join_step)
         return;
 
-    auto join_ptr = std::dynamic_pointer_cast<FullSortingMergeJoin>(join_step->getJoin());
+    auto * join_ptr = dynamic_cast<FullSortingMergeJoin *>(join_step->getJoin().get());
     if (!join_ptr)
         return;
 

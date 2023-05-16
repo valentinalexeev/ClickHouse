@@ -25,6 +25,7 @@
 #include <Processors/QueryPlan/JoinStep.h>
 #include <Processors/QueryPlan/LimitStep.h>
 #include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
+#include <Processors/QueryPlan/Optimizations/optimizeInOrderCommon.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
 #include <Processors/QueryPlan/SortingStep.h>
 #include <Processors/QueryPlan/TotalsHavingStep.h>
@@ -33,14 +34,9 @@
 
 #include <Storages/StorageMerge.h>
 
-#include <Processors/QueryPlan/Optimizations/optimizeInOrderCommon.h>
-
 
 namespace DB::QueryPlanOptimizations
 {
-
-using Positions = std::set<size_t>;
-using Permutation = std::vector<size_t>;
 
 static ISourceStep * checkSupportedReadingStep(IQueryPlanStep * step)
 {
@@ -157,7 +153,7 @@ static void appendFixedColumnsFromFilterExpression(const ActionsDAG::Node & filt
 
                 if (maybe_fixed_column && num_constant_columns + 1 == node->children.size())
                 {
-                    LOG_TEST(getLogger(), "Added fixed column {} {}", maybe_fixed_column->result_name, static_cast<const void *>(maybe_fixed_column));
+                    //std::cerr << "====== Added fixed column " << maybe_fixed_column->result_name << ' ' << static_cast<const void *>(maybe_fixed_column) << std::endl;
                     fixed_columns.insert(maybe_fixed_column);
 
                     /// Support injective functions chain.
@@ -493,9 +489,11 @@ StepInputOrder buildInputOrderInfo(
     ReverseMatches reverse_matches;
 
     /// Map from key_name to its positions in key_names.
-    std::unordered_map<std::string_view, Positions> not_matched_keys;
+    /// It can be more than one position for each key
+    /// (e.g. for `JOIN ON t1.a = t2.a AND t1.b = t2.b AND t1.a = t2.c` keys for t1 are (a, b, a)).
+    std::unordered_map<std::string_view, std::vector<size_t>> not_matched_keys;
     for (size_t i = 0; i < key_names.size(); ++i)
-        not_matched_keys[key_names[i]].insert(i);
+        not_matched_keys[key_names[i]].push_back(i);
 
     if (dag)
     {
@@ -545,8 +543,8 @@ StepInputOrder buildInputOrderInfo(
     size_t next_sort_key = 0;
 
     /// Maps elements from target_sort_description (with corresponding indices) to original positions in key_names.
-    std::vector<Positions> permutation;
-    permutation.reserve(not_matched_keys.size());
+    std::vector<size_t> permutation;
+    permutation.reserve(key_names.size());
 
     SortDescription target_sort_description;
     target_sort_description.reserve(not_matched_keys.size());
@@ -566,7 +564,7 @@ StepInputOrder buildInputOrderInfo(
         /// So far, 0 means any direction is possible. It is ok for constant prefix.
         int current_direction = 0;
         bool strict_monotonic = true;
-        typename decltype(not_matched_keys)::iterator group_by_key_it;
+        typename decltype(not_matched_keys)::iterator key_it;
 
         const ActionsDAG::Node * sort_column_node = sorting_key_dag.tryFindInOutputs(sorting_key_column);
         /// This should not happen.
@@ -584,13 +582,13 @@ StepInputOrder buildInputOrderInfo(
             if (sort_column_node->type != ActionsDAG::ActionType::INPUT)
                 break;
 
-            group_by_key_it = not_matched_keys.find(sorting_key_column);
-            if (group_by_key_it == not_matched_keys.end())
+            key_it = not_matched_keys.find(sorting_key_column);
+            if (key_it == not_matched_keys.end())
                 break;
 
             current_direction = 1;
 
-            LOG_TEST(getLogger(), "Found direct match with (no dag)");
+            //std::cerr << "====== (no dag) Found direct match" << std::endl;
             ++next_sort_key;
         }
         else
@@ -603,14 +601,14 @@ StepInputOrder buildInputOrderInfo(
                 match = &match_it->second->second;
             }
 
-            LOG_TEST(getLogger(), "Finding match for {} {}", sort_column_node->result_name, static_cast<const void *>(sort_column_node));
+            //std::cerr << "====== Finding match for " << sort_column_node->result_name << ' ' << static_cast<const void *>(sort_column_node) << std::endl;
 
             if (match && match->node)
-                group_by_key_it = not_matched_keys.find(group_by_key_node->result_name);
+                key_it = not_matched_keys.find(group_by_key_node->result_name);
 
-            if (match && match->node && group_by_key_it != not_matched_keys.end())
+            if (match && match->node && key_it != not_matched_keys.end())
             {
-                LOG_TEST(getLogger(), "Found direct match");
+                //std::cerr << "====== Found direct match" << std::endl;
 
                 current_direction = 1;
                 if (match->monotonicity)
@@ -623,7 +621,7 @@ StepInputOrder buildInputOrderInfo(
             }
             else if (fixed_key_columns.contains(sort_column_node))
             {
-                LOG_TEST(getLogger(), "Found fixed key by match");
+                //std::cerr << "+++++++++ Found fixed key by match" << std::endl;
                 ++next_sort_key;
             }
             else
@@ -648,17 +646,17 @@ StepInputOrder buildInputOrderInfo(
             /// Here, current_direction will be -1 cause negate() is negative montonic,
             /// Prefix sort description for reading will be (negate(y) DESC, negate(x) DESC),
             /// Sort description for GROUP BY will be (negate(y) DESC, negate(x) DESC, z).
-            LOG_TEST(getLogger(), "Adding {} to sort_description", std::string(group_by_key_it->first));
-            target_sort_description.emplace_back(SortColumnDescription(std::string(group_by_key_it->first), current_direction));
-            permutation.emplace_back(group_by_key_it->second);
+            //std::cerr << "---- adding " << std::string(*key_it) << std::endl;
+            target_sort_description.emplace_back(SortColumnDescription(std::string(key_it->first), current_direction));
+            permutation.insert(permutation.end(), key_it->second.begin(), key_it->second.end());
 
-            order_key_prefix_descr.emplace_back(SortColumnDescription(std::string(group_by_key_it->first), current_direction));
-            not_matched_keys.erase(group_by_key_it);
+            order_key_prefix_descr.emplace_back(SortColumnDescription(std::string(key_it->first), current_direction));
+            not_matched_keys.erase(key_it);
         }
         else
         {
             /// If column is fixed, will read it in table order as well.
-            LOG_TEST(getLogger(), "Adding {} to sort_description", sorting_key_column);
+            //std::cerr << "---- adding " << sorting_key_column << std::endl;
             order_key_prefix_descr.emplace_back(SortColumnDescription(sorting_key_column, 1));
         }
 
@@ -674,7 +672,7 @@ StepInputOrder buildInputOrderInfo(
     for (const auto & [key, positions] : not_matched_keys)
     {
         target_sort_description.emplace_back(SortColumnDescription(std::string(key)));
-        permutation.emplace_back(positions);
+        permutation.insert(permutation.end(), positions.begin(), positions.end());
     }
 
     auto input_order = std::make_shared<InputOrderInfo>(order_key_prefix_descr, next_sort_key, /* read_direction */ 1, /* limit */ 0);

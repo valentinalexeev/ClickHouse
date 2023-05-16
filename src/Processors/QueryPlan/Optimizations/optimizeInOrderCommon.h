@@ -16,7 +16,6 @@ namespace DB::QueryPlanOptimizations
 
 using StepStack = std::vector<IQueryPlanStep *>;
 
-using Positions = std::set<size_t>;
 using Permutation = std::vector<size_t>;
 
 /// Sort description for step that requires sorting (aggregation or sorting JOIN).
@@ -41,7 +40,7 @@ struct StepInputOrder
     SortDescription target_sort_description;
 
     /// Map indices from target_sort_description original positions
-    std::vector<Positions> permutation;
+    Permutation permutation;
 };
 
 /// FixedColumns are columns which values become constants after filtering.

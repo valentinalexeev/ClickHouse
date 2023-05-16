@@ -34,7 +34,9 @@ void FullSortingMergeJoin::permuteKeys(const std::vector<size_t> & permutation)
     assertIsPermutation(permutation);
 
     Names new_key_names_left;
+    new_key_names_left.reserve(permutation.size());
     Names new_key_names_right;
+    new_key_names_right.reserve(permutation.size());
     for (size_t idx : permutation)
     {
         new_key_names_left.push_back(join_on.key_names_left[idx]);

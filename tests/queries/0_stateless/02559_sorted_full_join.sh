@@ -39,7 +39,7 @@ AS SELECT
 FROM numbers(1000);
 "
 
-CLIENT_ARGS='--join_algorithm=full_sorting_merge --optimize_sorting_by_input_stream_properties=1 --optimize_read_in_order=1 --max_threads=8 --max_block_size=128'
+CLIENT_ARGS='--join_algorithm=full_sorting_merge --query_plan_joing_in_order=1 --optimize_sorting_by_input_stream_properties=1 --optimize_read_in_order=1 --max_threads=8 --max_block_size=128 --read_in_order_two_level_merge_threshold=999999'
 
 # test_query <expected_number_of_tables_to_read_in_order> <query>
 function test_query {
@@ -50,9 +50,14 @@ function test_query {
     result=$( $CLICKHOUSE_CLIENT $CLIENT_ARGS -q "EXPLAIN PIPELINE ${query_str}" )
     read_in_order_count=$( echo "$result" | grep 'MergeTreeInOrder' | wc -l )
 
-    test "$read_in_order_count" -eq "$expected_result" || echo "fail ${BASH_LINENO[0]}: expected: $expected_result, got: $read_in_order_count in '${query_str}'"
+    test "$read_in_order_count" -eq "$expected_result" || echo "fail ${BASH_LINENO[0]}: expected: $expected_result, got: $read_in_order_count in '${query_str}' @ ${result}"
 
     echo "$result" | grep -q 'FilterOnTheFly' && echo "fail ${BASH_LINENO[0]}: step FilterOnTheFly should not be present for read in order"
+
+    # compare results for query with and without read in order
+    test "$( $CLICKHOUSE_CLIENT $CLIENT_ARGS -q "${query_str}" | sort | md5sum )" = \
+         "$( $CLICKHOUSE_CLIENT --join_algorithm=full_sorting_merge --query_plan_joing_in_order=0 -q "${query_str}" | sort | md5sum )" \
+         || echo "fail ${BASH_LINENO[0]}: different results for '${query_str}'"
 }
 
 # Simple case: join by sorted prefix with length 1
@@ -67,7 +72,7 @@ test_query 2 'SELECT * FROM t1 JOIN t3 USING (x, x, x, y, y, y, y, x, x, x)'
 # Keys can be reordered
 test_query 2 'SELECT * FROM t1 JOIN t3 USING (y, x)'
 
-# Reoderinbg and deduplication for ON syntax:
+# Reordering and deduplication for ON syntax:
 test_query 2 'SELECT * FROM t1 JOIN t3 ON t1.x = t3.x AND t1.y = t3.y'
 test_query 2 'SELECT * FROM t1 JOIN t3 ON t1.x = t3.x AND t1.y = t3.y AND t1.y = t3.y AND t1.y = t3.y AND t1.x = t3.x AND t1.x = t3.x'
 test_query 2 'SELECT * FROM t1 JOIN t3 ON t1.y = t3.y AND t1.x = t3.x'
@@ -76,6 +81,11 @@ test_query 2 'SELECT * FROM t1 JOIN t4 ON t1.y = t4.x AND t1.x = t4.y'
 
 # Names doesn't matter (`x,y` or `a,b` in the table)
 test_query 2 'SELECT * FROM t1 JOIN t2 ON t1.x = t2.a'
+
+# Fixed keys in prefix
+test_query 0 'SELECT * FROM t1 JOIN t2 ON t1.y = t2.b SETTINGS max_rows_in_set_to_optimize_join = 0'
+test_query 2 'SELECT * FROM t1 JOIN t2 ON t1.y = t2.b WHERE t1.x = 1 AND t2.a = 1'
+
 test_query 2 'SELECT * FROM t1 JOIN t2 ON x = a'
 
 test_query 2 'SELECT * FROM t1 JOIN t2 ON t1.x = t2.a AND t1.y = t2.b'
